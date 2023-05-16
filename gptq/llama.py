@@ -287,7 +287,7 @@ def load_quant(model, checkpoint, wbits, groupsize=-1):
 
     return model
 
-def llama_multigpu(model, gpus):
+def llama_multigpu(model, gpus): #
     model.model.embed_tokens = model.model.embed_tokens.to(gpus[0])
     if hasattr(model.model, 'norm') and model.model.norm:
         model.model.norm = model.model.norm.to(gpus[-1])
@@ -316,7 +316,7 @@ def llama_multigpu(model, gpus):
     for i in range(len(layers)):
         layers[i] = MoveModule(layers[i].to(gpus[i // pergpu]))
 
-    model.gpus = gpus
+    model.gpus = gpus 
 
 def benchmark(model, input_ids, check=False):
     input_ids = input_ids.to(model.gpus[0] if hasattr(model, 'gpus') else DEV)
