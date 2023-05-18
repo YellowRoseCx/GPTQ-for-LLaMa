@@ -108,6 +108,15 @@ All experiments were run on a single NVIDIA RTX3090.
 
 # Language Generation
 ## LLaMA
+The format for using this version of GPTQ has changed from specifying python files, to specifying the module name.
+| Old Command | New Way |
+| --- | --- |
+| python llama.py | python -m gptq.llama |
+| python gptj.py | python -m gptq.gptj |
+| python opt.py | python -m gptq.opt |
+| python gptneox.py | python -m gptq.gptneox |
+| python llama_inference.py | python -m gptq.llama_inference |
+| python convert\_llama\_weights\_to\_hf.py | python -m gptq. convert\_llama\_weights\_to\_hf |
 
 ```
 #convert LLaMA to hf
