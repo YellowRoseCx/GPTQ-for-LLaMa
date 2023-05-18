@@ -116,6 +116,7 @@ The format for using this version of GPTQ has changed from specifying python fil
 | python opt.py | python -m gptq.opt |
 | python gptneox.py | python -m gptq.gptneox |
 | python llama_inference.py | python -m gptq.llama_inference |
+| python llama_inference_offload.py | python -m gptq.llama_inference_offload |
 | python convert\_llama\_weights\_to\_hf.py | python -m gptq. convert\_llama\_weights\_to\_hf |
 
 ```
