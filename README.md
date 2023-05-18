@@ -80,8 +80,9 @@ According to [GPTQ paper](https://arxiv.org/abs/2210.17323), As the size of the 
 ```pip install git+https://github.com/0cc4m/GPTQ-for-LLaMa@c884b421a233f9603d8224c9b22c2d83dd2c1fc4```
 
 old instructions:
-      If you don't have [conda](https://docs.conda.io/en/latest/miniconda.html), install it first.
-      ```
+
+If you don't have [conda](https://docs.conda.io/en/latest/miniconda.html), install it first.
+
       conda create --name gptq python=3.9 -y
       conda activate gptq
       conda install pytorch torchvision torchaudio pytorch-cuda=11.7 -c pytorch -c nvidia
@@ -95,7 +96,7 @@ old instructions:
 
       # Benchmark performance for FC2 layer of LLaMa-7B
       CUDA_VISIBLE_DEVICES=0 python test_kernel.py
-      ```
+      
 ## Dependencies
 
 * `torch`: tested on v2.0.0+cu117
