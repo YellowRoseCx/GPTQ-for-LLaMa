@@ -1,17 +1,18 @@
 import time
-
+import math
 import torch
 import torch.nn as nn
 
 import transformers
 
 from .gptq import GPTQ
-from .modelutils import DEV, find_layers, GPTQVERSION, make_quant
+from .modelutils import DEV, GPUS, find_layers, GPTQVERSION, make_quant
 if GPTQVERSION == 1:
     from .quant_v2 import quantize, Quantizer, QuantLinear
 elif GPTQVERSION == 2:
     from .quant_v3 import quantize, Quantizer, QuantLinear
 from .fused_attn import make_quant_attn
+from accelerate import infer_auto_device_map
 
 
 def get_llama(model):
@@ -22,8 +23,17 @@ def get_llama(model):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     from transformers import LlamaForCausalLM
-    model = LlamaForCausalLM.from_pretrained(model, torch_dtype='auto')
-    model.seqlen = 2048
+    #max_memory_mapping = {torch.device('cuda:1'): "4GB", torch.device('cuda:2'): "4GB", torch.device('cpu'): "60GB"}
+    device_map = {torch.device('cuda:1'): "4GB", torch.device('cuda:2'): "4GB", torch.device('cpu'): "60GB"}
+    #device_map = infer_auto_device_map(model, max_memory={0: "4GiB", 1: "4GiB", "cpu": "60GiB"})
+    if len(GPUS) > 1:
+        print(f"multigpu detected: {GPUS}")
+        model = LlamaForCausalLM.from_pretrained(model,low_cpu_mem_usage=True, torch_dtype='auto')#, max_memory=max_memory_mapping) # offload_folder='/media/3272A7FA72A7C0C9/offload'
+        model.seqlen = 2048
+        llama_multigpu(model, GPUS)
+    else:
+        model = LlamaForCausalLM.from_pretrained(model, device_map={"auto"},low_cpu_mem_usage=True, torch_dtype='auto')#, max_memory=max_memory_mapping) # offload_folder='/media/3272A7FA72A7C0C9/offload'
+        model.seqlen = 2048
     return model
 
 @torch.no_grad()
@@ -287,7 +297,7 @@ def load_quant(model, checkpoint, wbits, groupsize=-1):
 
     return model
 
-def llama_multigpu(model, gpus): #
+def llama_multigpu(model, gpus):
     model.model.embed_tokens = model.model.embed_tokens.to(gpus[0])
     if hasattr(model.model, 'norm') and model.model.norm:
         model.model.norm = model.model.norm.to(gpus[-1])
@@ -316,7 +326,7 @@ def llama_multigpu(model, gpus): #
     for i in range(len(layers)):
         layers[i] = MoveModule(layers[i].to(gpus[i // pergpu]))
 
-    model.gpus = gpus 
+    model.gpus = gpus
 
 def benchmark(model, input_ids, check=False):
     input_ids = input_ids.to(model.gpus[0] if hasattr(model, 'gpus') else DEV)
