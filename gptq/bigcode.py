@@ -1,4 +1,3 @@
-import math
 import time
 
 import torch
@@ -15,7 +14,7 @@ elif GPTQVERSION == 2:
     from .quant_v3 import quantize, Quantizer, QuantLinear
 
 
-def get_gptj(model):
+def get_bigcode(model):
     import torch
 
     def skip(*args, **kwargs):
@@ -24,15 +23,15 @@ def get_gptj(model):
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
-    from transformers import GPTJForCausalLM
+    from transformers import GPTBigCodeForCausalLM
 
-    model = GPTJForCausalLM.from_pretrained(model, torch_dtype="auto")
+    model = GPTBigCodeForCausalLM.from_pretrained(model, torch_dtype="auto")
     model.seqlen = 2048
     return model
 
 
 @torch.no_grad()
-def gptj_sequential(model, dataloader, dev):
+def bigcode_sequential(model, dataloader, dev):
     print("Starting ...")
 
     use_cache = model.config.use_cache
@@ -40,6 +39,7 @@ def gptj_sequential(model, dataloader, dev):
     layers = model.transformer.h
 
     model.transformer.wte = model.transformer.wte.to(dev)
+    model.transformer.wpe = model.transformer.wpe.to(dev)
     model.transformer.ln_f = model.transformer.ln_f.to(dev)
     layers[0] = layers[0].to(dev)
 
@@ -54,11 +54,10 @@ def gptj_sequential(model, dataloader, dev):
             super().__init__()
             self.module = module
 
-        def forward(self, hidden_states, **kwargs):
-            inps[cache["i"]] = hidden_states
+        def forward(self, inp, **kwargs):
+            inps[cache["i"]] = inp
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
-            cache["position_ids"] = kwargs["position_ids"]
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -71,12 +70,12 @@ def gptj_sequential(model, dataloader, dev):
 
     layers[0] = layers[0].cpu()
     model.transformer.wte = model.transformer.wte.cpu()
+    model.transformer.wpe = model.transformer.wpe.cpu()
     model.transformer.ln_f = model.transformer.ln_f.cpu()
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
-    attention_mask = cache["attention_mask"]
-    position_ids = cache["position_ids"]
+    attention_mask = cache["attention_mask"].to(dev)
 
     print("Ready.")
 
@@ -86,10 +85,10 @@ def gptj_sequential(model, dataloader, dev):
         full = find_layers(layer)
         if args.true_sequential:
             sequential = [
-                ["attn.k_proj", "attn.v_proj", "attn.q_proj"],
-                ["attn.out_proj"],
-                ["mlp.fc_in"],
-                ["mlp.fc_out"],
+                ["attn.c_attn"],
+                ["attn.c_proj"],
+                ["mlp.c_fc"],
+                ["mlp.c_proj"],
             ]
         else:
             sequential = [list(full.keys())]
@@ -114,11 +113,7 @@ def gptj_sequential(model, dataloader, dev):
             for name in subset:
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
             for j in range(args.nsamples):
-                outs[j] = layer(
-                    inps[j].unsqueeze(0),
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                )[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
             for h in handles:
                 h.remove()
 
@@ -152,11 +147,7 @@ def gptj_sequential(model, dataloader, dev):
                 gptq[name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(
-                inps[j].unsqueeze(0),
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-            )[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
 
         layers[i] = layer.cpu()
         del layer
@@ -171,7 +162,7 @@ def gptj_sequential(model, dataloader, dev):
 
 
 @torch.no_grad()
-def gptj_eval(model, testenc, dev):
+def bigcode_eval(model, testenc, dev):
     print("Evaluating ...")
 
     testenc = testenc.input_ids
@@ -182,6 +173,7 @@ def gptj_eval(model, testenc, dev):
     layers = model.transformer.h
 
     model.transformer.wte = model.transformer.wte.to(dev)
+    model.transformer.wpe = model.transformer.wpe.to(dev)
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
@@ -199,7 +191,6 @@ def gptj_eval(model, testenc, dev):
             inps[cache["i"]] = inp
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
-            cache["position_ids"] = kwargs["position_ids"]
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -213,11 +204,11 @@ def gptj_eval(model, testenc, dev):
 
     layers[0] = layers[0].cpu()
     model.transformer.wte = model.transformer.wte.cpu()
+    model.transformer.wpe = model.transformer.wpe.cpu()
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
-    position_ids = cache["position_ids"]
 
     for i in range(len(layers)):
         print(i)
@@ -237,11 +228,7 @@ def gptj_eval(model, testenc, dev):
                 ).to(next(iter(layer.parameters())).dtype)
 
         for j in range(nsamples):
-            outs[j] = layer(
-                inps[j].unsqueeze(0),
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-            )[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
@@ -273,7 +260,7 @@ def gptj_eval(model, testenc, dev):
 
 
 # TODO: perform packing on GPU
-def gptj_pack(model, quantizers, wbits, groupsize):
+def bigcode_pack(model, quantizers, wbits, groupsize):
     layers = find_layers(model)
     layers = {n: layers[n] for n in quantizers}
     make_quant(model, quantizers, wbits, groupsize)
@@ -294,21 +281,21 @@ def gptj_pack(model, quantizers, wbits, groupsize):
 
 
 def load_quant(model, checkpoint, wbits, groupsize=-1):
-    from transformers import GPTJConfig, GPTJForCausalLM
+    from transformers import GPTBigCodeConfig, GPTBigCodeForCausalLM
 
-    config = GPTJConfig.from_pretrained(model)
+    config = GPTBigCodeConfig.from_pretrained(model)
 
     def noop(*args, **kwargs):
         pass
 
     torch.nn.init.kaiming_uniform_ = noop
     torch.nn.init.uniform_ = noop
-    torch.nn.init.ln_fal_ = noop
+    torch.nn.init.normal_ = noop
 
     torch.set_default_dtype(torch.half)
     transformers.modeling_utils._init_weights = False
     torch.set_default_dtype(torch.half)
-    model = GPTJForCausalLM(config)
+    model = GPTBigCodeForCausalLM(config)
     torch.set_default_dtype(torch.float)
     model = model.eval()
     layers = find_layers(model)
@@ -332,8 +319,9 @@ def load_quant(model, checkpoint, wbits, groupsize=-1):
     return model
 
 
-def gptj_multigpu(model, gpus):
+def bigcode_multigpu(model, gpus):
     model.transformer.wte = model.transformer.wte.to(gpus[0])
+    model.transformer.wpe = model.transformer.wpe.to(gpus[0])
     if hasattr(model.transformer, "ln_f") and model.transformer.ln_f:
         model.transformer.ln_f = model.transformer.ln_f.to(gpus[-1])
     import copy
@@ -431,7 +419,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("model", type=str, help="gptj model to load")
+    parser.add_argument("model", type=str, help="bigcode model to load")
     parser.add_argument(
         "dataset",
         type=str,
@@ -518,7 +506,7 @@ if __name__ == "__main__":
     if args.load:
         model = load_quant(args.model, args.load, args.wbits, args.groupsize)
     else:
-        model = get_gptj(args.model)
+        model = get_bigcode(args.model)
         model.eval()
 
     dataloader, testloader = get_loaders(
@@ -527,18 +515,17 @@ if __name__ == "__main__":
         seed=args.seed,
         model=args.model,
         seqlen=model.seqlen,
-        use_fast=True,
     )
 
     if not args.load and args.wbits < 16 and not args.nearest:
         tick = time.time()
-        quantizers = gptj_sequential(model, dataloader, DEV)
+        quantizers = bigcode_sequential(model, dataloader, DEV)
         print(time.time() - tick)
 
     if args.benchmark:
         gpus = [torch.device("cuda:%d" % i) for i in range(torch.cuda.device_count())]
         if len(gpus) > 1:
-            gptj_multigpu(model, gpus)
+            bigcode_multigpu(model, gpus)
         else:
             model = model.to(DEV)
         if args.benchmark:
@@ -551,24 +538,22 @@ if __name__ == "__main__":
             datasets = ["wikitext2", "ptb-new", "c4-new"]
         for dataset in datasets:
             dataloader, testloader = get_loaders(
-                dataset,
-                seed=args.seed,
-                model=args.model,
-                seqlen=model.seqlen,
-                use_fast=True,
+                dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
             )
             print(dataset)
-            gptj_eval(model, testloader, DEV)
+            bigcode_eval(model, testloader, DEV)
 
     if args.load:
         exit()
 
     if args.save:
-        gptj_pack(model, quantizers, args.wbits, args.groupsize)
+        bigcode_pack(model, quantizers, args.wbits, args.groupsize)
         torch.save(model.state_dict(), args.save)
 
     if args.save_safetensors:
-        gptj_pack(model, quantizers, args.wbits, args.groupsize)
+        bigcode_pack(model, quantizers, args.wbits, args.groupsize)
         from safetensors.torch import save_file as safe_save
 
-        safe_save(model.state_dict(), args.save_safetensors)
+        state_dict = model.state_dict()
+        state_dict = {k: v.clone().contiguous() for k, v in state_dict.items()}
+        safe_save(state_dict, args.save_safetensors)
