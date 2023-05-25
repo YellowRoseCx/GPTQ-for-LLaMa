@@ -13,7 +13,10 @@ elif GPTQVERSION == 2:
     from .quant_v3 import quantize, Quantizer, QuantLinear
 from .fused_attn import make_quant_attn
 from accelerate import infer_auto_device_map
-global Offload_Disk_Folder = "./offload" # Only gets used if you run out of VRAM, RAM, and Swap
+
+global user_gpu1_size 
+global user_ram_size 
+ 
 
 def get_llama(model):
     import torch
@@ -23,10 +26,11 @@ def get_llama(model):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     from transformers import LlamaForCausalLM
-    device_mem_map = infer_auto_device_map(LlamaForCausalLM.from_pretrained(model, low_cpu_mem_usage=True, torch_dtype='auto', offload_folder=Offload_Disk_Folder))
-    model = LlamaForCausalLM.from_pretrained(model, max_memory=device_mem_map, low_cpu_mem_usage=True, torch_dtype='auto', offload_folder=Offload_Disk_Folder)
+    device_map = infer_auto_device_map(LlamaForCausalLM.from_pretrained(model, low_cpu_mem_usage=True, torch_dtype='auto'), max_memory={0: "14GiB", 1: "4GiB", "cpu": user_ram_size})
+    model = LlamaForCausalLM.from_pretrained(model, device_map=device_map, max_memory=device_map, low_cpu_mem_usage=True, torch_dtype='auto', offload_folder='./offload')
     model.seqlen = 2048
     return model
+
 
 @torch.no_grad()
 def llama_sequential(model, dataloader, dev):
@@ -36,9 +40,9 @@ def llama_sequential(model, dataloader, dev):
     model.config.use_cache = False
     layers = model.model.layers
 
-    model.model.embed_tokens = model.model.embed_tokens.to(dev)
-    model.model.norm = model.model.norm.to(dev)
-    layers[0] = layers[0].to(dev)
+    gpus = [torch.device('cuda:%d' % i) for i in range(torch.cuda.device_count())]
+    if len(gpus) > 1:
+        llama_multigpu(model, gpus)
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros(
@@ -291,8 +295,8 @@ def load_quant(model, checkpoint, wbits, groupsize=-1):
 
 def llama_multigpu(model, gpus):
     model.model.embed_tokens = model.model.embed_tokens.to(gpus[0])
-    if hasattr(model.model, 'norm') and model.model.norm:
-        model.model.norm = model.model.norm.to(gpus[-1])
+#    if hasattr(model.model, 'norm') and model.model.norm:
+#        model.model.norm = model.model.norm.to(gpus[-1])
     import copy
     model.lm_head = copy.deepcopy(model.lm_head).to(gpus[-1])
 
@@ -454,7 +458,18 @@ if __name__ == '__main__':
         '--new-eval', action='store_true',
         help='Whether to use the new PTB and C4 eval'
     )
+    parser.add_argument(
+        '--maxgpuram', type=str, default='4GB',
+        help='Set the max GPU-1 RAM you want to use.'
+    )
+    parser.add_argument(
+        '--maxram', type=str, default='60GB',
+        help='Set the max CPU RAM you want to use.'
+    )
     args = parser.parse_args()
+    user_gpu1_size = args.maxgpuram if args.maxgpuram is not None else None
+    user_ram_size = args.maxram if args.maxram is not None else None
+
 
     if type(args.load) is not str:
         args.load = args.load.as_posix()
@@ -464,6 +479,7 @@ if __name__ == '__main__':
     else:
         model = get_llama(args.model)
         model.eval()
+
 
     dataloader, testloader = get_loaders(
         args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
