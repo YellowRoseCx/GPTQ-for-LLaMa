@@ -43,6 +43,10 @@ def llama_sequential(model, dataloader, dev):
     gpus = [torch.device('cuda:%d' % i) for i in range(torch.cuda.device_count())]
     if len(gpus) > 1:
         llama_multigpu(model, gpus)
+    else:
+        model.model.embed_tokens = model.model.embed_tokens.to(dev)
+        model.model.norm = model.model.norm.to(dev)
+        layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros(
