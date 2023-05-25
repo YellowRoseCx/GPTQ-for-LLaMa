@@ -1,19 +1,19 @@
 import time
-import math
+
 import torch
 import torch.nn as nn
 
 import transformers
 
 from .gptq import GPTQ
-from .modelutils import DEV, GPUS, find_layers, GPTQVERSION, make_quant
+from .modelutils import DEV, find_layers, GPTQVERSION, make_quant
 if GPTQVERSION == 1:
     from .quant_v2 import quantize, Quantizer, QuantLinear
 elif GPTQVERSION == 2:
     from .quant_v3 import quantize, Quantizer, QuantLinear
 from .fused_attn import make_quant_attn
 from accelerate import infer_auto_device_map
-
+global Offload_Disk_Folder = "./offload" # Only gets used if you run out of VRAM, RAM, and Swap
 
 def get_llama(model):
     import torch
@@ -23,17 +23,9 @@ def get_llama(model):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     from transformers import LlamaForCausalLM
-    #max_memory_mapping = {torch.device('cuda:1'): "4GB", torch.device('cuda:2'): "4GB", torch.device('cpu'): "60GB"}
-    device_map = {torch.device('cuda:1'): "4GB", torch.device('cuda:2'): "4GB", torch.device('cpu'): "60GB"}
-    #device_map = infer_auto_device_map(model, max_memory={0: "4GiB", 1: "4GiB", "cpu": "60GiB"})
-    if len(GPUS) > 1:
-        print(f"multigpu detected: {GPUS}")
-        model = LlamaForCausalLM.from_pretrained(model,low_cpu_mem_usage=True, torch_dtype='auto')#, max_memory=max_memory_mapping) # offload_folder='/media/3272A7FA72A7C0C9/offload'
-        model.seqlen = 2048
-        llama_multigpu(model, GPUS)
-    else:
-        model = LlamaForCausalLM.from_pretrained(model, device_map={"auto"},low_cpu_mem_usage=True, torch_dtype='auto')#, max_memory=max_memory_mapping) # offload_folder='/media/3272A7FA72A7C0C9/offload'
-        model.seqlen = 2048
+    device_mem_map = infer_auto_device_map(LlamaForCausalLM.from_pretrained(model, low_cpu_mem_usage=True, torch_dtype='auto', offload_folder=Offload_Disk_Folder))
+    model = LlamaForCausalLM.from_pretrained(model, max_memory=device_mem_map, low_cpu_mem_usage=True, torch_dtype='auto', offload_folder=Offload_Disk_Folder)
+    model.seqlen = 2048
     return model
 
 @torch.no_grad()
