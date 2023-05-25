@@ -10,12 +10,7 @@ from . import quant_v3
 GPTQVERSION = int(os.environ.get("GPTQVERSION", 1))
 if GPTQVERSION < 0 or GPTQVERSION > 2:
     raise NotImplementedError(f"Unsupported gptq version: {GPTQVERSION}")
-gpus = [torch.device('cuda:%d' % i) for i in range(torch.cuda.device_count())]
-DEV = ""
-if len(gpus) > 1:
-    GPUS = gpus
-else:
-    DEV = torch.device('cuda:0')
+DEV = torch.device('cuda:0')
 
 
 def find_layers(module, layers=[nn.Conv2d, nn.Linear], name=''):
