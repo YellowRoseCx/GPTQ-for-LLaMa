@@ -464,7 +464,7 @@ if __name__ == '__main__':
         help='Whether to use the new PTB and C4 eval'
     )
     parser.add_argument(
-        '--maxgpuram', type=str, nargs=+, default='4GB',
+        '--maxgpuram', type=str, nargs='+', default='4GB',
         help='Set the max GPU RAM you want to use. Able to be set for GPU 1 and GPU 2'
     )
     parser.add_argument(
