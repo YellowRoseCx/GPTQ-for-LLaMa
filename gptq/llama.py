@@ -295,8 +295,8 @@ def load_quant(model, checkpoint, wbits, groupsize=-1):
 
 def llama_multigpu(model, gpus):
     model.model.embed_tokens = model.model.embed_tokens.to(gpus[0])
-#    if hasattr(model.model, 'norm') and model.model.norm:
-#        model.model.norm = model.model.norm.to(gpus[-1])
+    if hasattr(model.model, 'norm') and model.model.norm:
+        model.model.norm = model.model.norm.to(gpus[-1])
     import copy
     model.lm_head = copy.deepcopy(model.lm_head).to(gpus[-1])
 
