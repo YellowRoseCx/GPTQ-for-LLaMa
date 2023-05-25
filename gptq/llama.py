@@ -15,6 +15,7 @@ from .fused_attn import make_quant_attn
 from accelerate import infer_auto_device_map
 
 global user_gpu1_size 
+global user_gpu2_size
 global user_ram_size 
  
 
@@ -26,7 +27,7 @@ def get_llama(model):
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     from transformers import LlamaForCausalLM
-    device_map = infer_auto_device_map(LlamaForCausalLM.from_pretrained(model, low_cpu_mem_usage=True, torch_dtype='auto'), max_memory={0: "14GiB", 1: "4GiB", "cpu": user_ram_size})
+    device_map = infer_auto_device_map(LlamaForCausalLM.from_pretrained(model, low_cpu_mem_usage=True, torch_dtype='auto'), max_memory={0: user_gpu1_size, 1: user_gpu2_size, "cpu": user_ram_size})
     model = LlamaForCausalLM.from_pretrained(model, device_map=device_map, max_memory=device_map, low_cpu_mem_usage=True, torch_dtype='auto', offload_folder='./offload')
     model.seqlen = 2048
     return model
@@ -463,15 +464,16 @@ if __name__ == '__main__':
         help='Whether to use the new PTB and C4 eval'
     )
     parser.add_argument(
-        '--maxgpuram', type=str, default='4GB',
-        help='Set the max GPU-1 RAM you want to use.'
+        '--maxgpuram', type=str, nargs=+, default='4GB',
+        help='Set the max GPU RAM you want to use. Able to be set for GPU 1 and GPU 2'
     )
     parser.add_argument(
         '--maxram', type=str, default='60GB',
         help='Set the max CPU RAM you want to use.'
     )
     args = parser.parse_args()
-    user_gpu1_size = args.maxgpuram if args.maxgpuram is not None else None
+    user_gpu1_size = args.maxgpuram[0] if args.maxgpuram[0] is not None else None
+    user_gpu2_size = args.maxgpuram[1] if args.maxgpuram[1] is not None else None
     user_ram_size = args.maxram if args.maxram is not None else None
 
 
