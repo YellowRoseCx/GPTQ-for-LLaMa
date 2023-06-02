@@ -4,58 +4,68 @@ from transformers.models.llama.modeling_llama import LlamaModel
 from transformers.models.opt.modeling_opt import OPTModel
 from transformers.models.gpt_neox.modeling_gpt_neox import GPTNeoXModel
 from transformers.models.gptj.modeling_gptj import GPTJModel
-from transformers.modeling_outputs import BaseModelOutputWithPast
+from transformers.models.gpt_bigcode.modeling_gpt_bigcode import GPTBigCodeModel
+mpt_support = True
+try:
+    from hf_bleeding_edge.mpt.modeling_mpt import MPTModel
+except ImportError:
+    mpt_support = False
+from transformers.modeling_outputs import BaseModelOutputWithPast, BaseModelOutputWithPastAndCrossAttentions
 from typing import List, Optional, Tuple, Union
 
-from dequant import dequant_layer
+from .dequant import dequant_layer
 
 
-def offload_loop_start(self, idx, hidden_states, attention_mask, position_ids):
-    decoder_layer = self.layers[idx]
+def offload_loop_start(self, layers, idx, hidden_states, attention_mask, position_ids, past_key_value):
+    decoder_layer = layers[idx]
     device = next(decoder_layer.parameters()).device
+    dtype = torch.float32 if self.offload_type == 1 and device == self.cpu_device else torch.float16
 
     if device != hidden_states.device:
         # Move auxiliary values
-        dtype = torch.float32 if device == self.cpu_device else torch.float16
         hidden_states = hidden_states.to(device, dtype, True)
-        attention_mask = attention_mask.to(device, dtype, True)
-        position_ids = position_ids.to(device, torch.int64, True)
+        if position_ids is not None:
+            position_ids = position_ids.to(device, torch.int64, True)
+    if attention_mask is not None and device != attention_mask.device:
+        attention_mask = attention_mask.to(device, torch.bool, True)
+    if past_key_value not in (None, ()) and device != past_key_value[0].device:
+        past_key_value = (past_key_value[0].to(device, dtype, True), past_key_value[1].to(device, dtype, True))
 
-    return decoder_layer, hidden_states, attention_mask, position_ids
+    return decoder_layer, hidden_states, attention_mask, position_ids, past_key_value
 
 
-def offload_loop_end(self, idx):
+def offload_loop_end(self, layers, idx):
     if self.offload_type != 0:
         return
 
-    gpu = next(self.layers[idx].parameters()).device
+    gpu = next(layers[idx].parameters()).device
     # Move one layer off the GPU(s), and one onto a GPU
     if not self.fast_offload:
-        self.layers[idx].to(self.cpu_device, torch.float16, True)
+        layers[idx].to(self.cpu_device, torch.float16, True)
         next_cpu_layer = (idx + self.gpu_layers) % self.layer_count
-        self.layers[next_cpu_layer].to(
+        layers[next_cpu_layer].to(
             gpu, torch.float16, True
         )
     elif idx < self.cpu_layers:
-        self.layers[idx].to(self.cpu_device, torch.float16, True)
+        layers[idx].to(self.cpu_device, torch.float16, True)
         next_cpu_layer = self.layer_count - idx - 1
-        self.layers[next_cpu_layer].to(
+        layers[next_cpu_layer].to(
             gpu, torch.float16, True
         )
 
 
-def offload_cleanup(self, hidden_states):
+def offload_cleanup(self, layers, hidden_states):
     hidden_states = hidden_states.to(self.primary_gpu, torch.float16, False)
     if self.offload_type != 0 or not self.fast_offload:
         return hidden_states
 
     for idx in range(0, self.cpu_layers):
         next_cpu_layer = self.layer_count - idx - 1
-        device = next(self.layers[next_cpu_layer].parameters()).device
-        self.layers[next_cpu_layer].to(
+        device = next(layers[next_cpu_layer].parameters()).device
+        layers[next_cpu_layer].to(
             self.cpu_device, torch.float16, False
         )
-        self.layers[idx].to(device, torch.float16, True)
+        layers[idx].to(device, torch.float16, True)
 
     return hidden_states
 
@@ -193,17 +203,17 @@ def llama_offload_forward(
     next_decoder_cache = () if use_cache else None
 
     for idx in range(len(self.layers)):
+        past_key_value = past_key_values[idx] if past_key_values is not None else None
         (
             decoder_layer,
             hidden_states,
             attention_mask,
             position_ids,
-        ) = offload_loop_start(self, idx, hidden_states, attention_mask, position_ids)
+            past_key_value,
+        ) = offload_loop_start(self, self.layers, idx, hidden_states, attention_mask, position_ids, past_key_value)
 
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
-
-        past_key_value = past_key_values[idx] if past_key_values is not None else None
 
         if self.gradient_checkpointing and self.training:
 
@@ -234,7 +244,7 @@ def llama_offload_forward(
         hidden_states = layer_outputs[0]
 
         offload_loop_end(
-            self, idx
+            self, self.layers, idx
         )
 
         if use_cache:
@@ -243,7 +253,7 @@ def llama_offload_forward(
         if output_attentions:
             all_self_attns += (layer_outputs[1],)
 
-    hidden_states = offload_cleanup(self, hidden_states)
+    hidden_states = offload_cleanup(self, self.layers, hidden_states)
 
     hidden_states = self.norm(hidden_states)
 
@@ -379,8 +389,8 @@ def gptneox_offload_forward(
     all_hidden_states = () if output_hidden_states else None
 
     for i, (layer, layer_past) in enumerate(zip(self.layers, past_key_values)):
-        layer, hidden_states, attention_mask, position_ids = offload_loop_start(
-            self, i, hidden_states, attention_mask, position_ids
+        layer, hidden_states, attention_mask, position_ids, layer_past = offload_loop_start(
+            self, self.layers, i, hidden_states, attention_mask, position_ids, layer_past
         )
 
         if output_hidden_states:
@@ -414,14 +424,14 @@ def gptneox_offload_forward(
             )
         hidden_states = outputs[0]
         offload_loop_end(
-            self, i
+            self, self.layers, i
         )
         if use_cache is True:
             presents = presents + (outputs[1],)
         if output_attentions:
             all_attentions = all_attentions + (outputs[2 if use_cache else 1],)
 
-    hidden_states = offload_cleanup(self, hidden_states)
+    hidden_states = offload_cleanup(self, self.layers, hidden_states)
 
     hidden_states = self.final_layer_norm(hidden_states)
     # Add last hidden state
@@ -561,8 +571,8 @@ def gptj_offload_forward(
     all_hidden_states = () if output_hidden_states else None
 
     for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
-        block, hidden_states, attention_mask, position_ids = offload_loop_start(
-            self, i, hidden_states, attention_mask, position_ids
+        block, hidden_states, attention_mask, position_ids, layer_past = offload_loop_start(
+            self, self.h, i, hidden_states, attention_mask, position_ids, layer_past
         )
         # Model parallel
         if self.model_parallel:
@@ -613,7 +623,7 @@ def gptj_offload_forward(
             presents = presents + (outputs[1],)
 
         offload_loop_end(
-            self, i
+            self, self.h, i
         )
 
         if output_attentions:
@@ -627,7 +637,7 @@ def gptj_offload_forward(
                 if i == v[-1] and "cuda:" + str(k) != self.last_device:
                     hidden_states = hidden_states.to("cuda:" + str(k + 1))
 
-    hidden_states = offload_cleanup(self, hidden_states)
+    hidden_states = offload_cleanup(self, self.h, hidden_states)
 
     hidden_states = self.ln_f(hidden_states)
 
@@ -790,12 +800,14 @@ def opt_offload_forward(
                 )
 
     for idx, decoder_layer in enumerate(self.layers):
+        past_key_value = past_key_values[idx] if past_key_values is not None else None
         (
             decoder_layer,
             hidden_states,
             attention_mask,
             position_ids,
-        ) = offload_loop_start(self, idx, hidden_states, attention_mask, position_ids)
+            past_key_value,
+        ) = offload_loop_start(self, self.layers, idx, hidden_states, attention_mask, position_ids, past_key_value)
         # add LayerDrop (see https://arxiv.org/abs/1909.11556 for description)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
@@ -803,8 +815,6 @@ def opt_offload_forward(
         dropout_probability = random.uniform(0, 1)
         if self.training and (dropout_probability < self.layerdrop):
             continue
-
-        past_key_value = past_key_values[idx] if past_key_values is not None else None
 
         if self.gradient_checkpointing and self.training:
 
@@ -835,7 +845,7 @@ def opt_offload_forward(
         hidden_states = layer_outputs[0]
 
         offload_loop_end(
-            self, idx
+            self, self.layers, idx
         )
 
         if use_cache:
@@ -844,7 +854,7 @@ def opt_offload_forward(
         if output_attentions:
             all_self_attns += (layer_outputs[1],)
 
-    hidden_states = offload_cleanup(self, hidden_states)
+    hidden_states = offload_cleanup(self, self.layers, hidden_states)
 
     if self.final_layer_norm is not None:
         hidden_states = self.final_layer_norm(hidden_states)
@@ -869,6 +879,275 @@ def opt_offload_forward(
         hidden_states=all_hidden_states,
         attentions=all_self_attns,
     )
+
+
+def bigcode_offload_forward(
+    self,
+    input_ids: Optional[torch.Tensor] = None,
+    past_key_values: Optional[Union[List[torch.Tensor], int]] = None,
+    attention_mask: Optional[torch.Tensor] = None,
+    token_type_ids: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.Tensor] = None,
+    head_mask: Optional[torch.Tensor] = None,
+    inputs_embeds: Optional[torch.Tensor] = None,
+    encoder_hidden_states: Optional[torch.Tensor] = None,
+    encoder_attention_mask: Optional[torch.Tensor] = None,
+    use_cache: Optional[bool] = None,
+    output_attentions: Optional[bool] = None,
+    output_hidden_states: Optional[bool] = None,
+    return_dict: Optional[bool] = None,
+) -> Union[Tuple, BaseModelOutputWithPastAndCrossAttentions]:
+    # If fast_offload not found, model is not initialized for offloading
+    if not "fast_offload" in dir(self):
+        return self.non_offload_forward(input_ids, past_key_values, attention_mask, token_type_ids, position_ids, head_mask, inputs_embeds, encoder_hidden_states, encoder_attention_mask, use_cache, output_attentions, output_hidden_states, return_dict)
+
+    output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+    output_hidden_states = (
+        output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
+    )
+    use_cache = use_cache if use_cache is not None else self.config.use_cache
+    return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+    if input_ids is not None and inputs_embeds is not None:
+        raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
+    elif input_ids is not None:
+        input_shape = input_ids.size()
+        input_ids = input_ids.view(-1, input_shape[-1])
+        batch_size = input_ids.shape[0]
+    elif inputs_embeds is not None:
+        input_shape = inputs_embeds.size()[:-1]
+        batch_size = inputs_embeds.shape[0]
+    else:
+        raise ValueError("You have to specify either input_ids or inputs_embeds")
+
+    if batch_size <= 0:
+        raise ValueError("batch_size has to be defined and > 0")
+
+    device = input_ids.device if input_ids is not None else inputs_embeds.device
+
+    if token_type_ids is not None:
+        token_type_ids = token_type_ids.view(-1, input_shape[-1])
+    if position_ids is not None:
+        position_ids = position_ids.view(-1, input_shape[-1])
+
+    if past_key_values is None:
+        past_length = 0
+        past_key_values = tuple([None] * len(self.h))
+    else:
+        past_length = past_key_values[0][0].size(-2)
+
+    if attention_mask is not None and len(attention_mask.shape) == 2 and position_ids is None:
+        # create position_ids on the fly for batch generation
+        position_ids = attention_mask.long().cumsum(-1) - 1
+        position_ids.masked_fill_(attention_mask == 0, 1)
+        if past_length > 0:
+            position_ids = position_ids[:, past_length : input_shape[-1] + past_length :]
+    elif position_ids is None:
+        position_ids = torch.arange(past_length, input_shape[-1] + past_length, dtype=torch.long, device=device)
+        position_ids = position_ids.unsqueeze(0).view(-1, input_shape[-1])
+
+    # Self-attention mask.
+    query_length = input_shape[-1]
+    key_length = past_length + query_length
+    self_attention_mask = self.bias[None, key_length - query_length : key_length, :key_length]
+
+    if attention_mask is not None:
+        self_attention_mask = self_attention_mask * attention_mask.view(batch_size, 1, -1).to(
+            dtype=torch.bool, device=self_attention_mask.device
+        )
+
+    # MQA models: (batch_size, query_length, n_heads, key_length)
+    # MHA models: (batch_size, n_heads, query_length, key_length)
+    attention_mask = self_attention_mask.unsqueeze(2 if self.multi_query else 1)
+
+    # If a 2D or 3D attention mask is provided for the cross-attention
+    # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
+    if (
+        self.config.add_cross_attention
+        and encoder_hidden_states is not None
+        and encoder_attention_mask is not None
+    ):
+        if encoder_attention_mask.dim() == 2:
+            encoder_attention_mask.unsqueeze(1)
+        assert encoder_attention_mask.dim() == 3
+        encoder_attention_mask = encoder_attention_mask.bool().unsqueeze(2 if self.multi_query else 1)
+    else:
+        encoder_attention_mask = None
+
+    # Prepare head mask if needed
+    # 1.0 in head_mask indicate we keep the head
+    # attention_probs has shape bsz x n_heads x N x N
+    # head_mask has shape n_layer x batch x n_heads x N x N
+    head_mask = self.get_head_mask(head_mask, self.config.n_layer)
+
+    if inputs_embeds is None:
+        inputs_embeds = self.wte(input_ids)
+    position_embeds = self.wpe(position_ids)
+    hidden_states = inputs_embeds + position_embeds
+
+    if token_type_ids is not None:
+        token_type_embeds = self.wte(token_type_ids)
+        hidden_states = hidden_states + token_type_embeds
+
+    hidden_states = self.drop(hidden_states)
+
+    output_shape = input_shape + (hidden_states.size(-1),)
+
+    presents = [] if use_cache else None
+    all_self_attentions = () if output_attentions else None
+    all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
+    all_hidden_states = () if output_hidden_states else None
+    for i, (block, layer_past) in enumerate(zip(self.h, past_key_values)):
+        hm = head_mask[i]
+        (
+            block,
+            hidden_states,
+            attention_mask,
+            hm,
+            layer_past,
+        ) = offload_loop_start(self, self.h, i, hidden_states, attention_mask, hm, layer_past)
+        if output_hidden_states:
+            all_hidden_states = all_hidden_states + (hidden_states,)
+
+        if self.gradient_checkpointing and self.training:
+
+            def create_custom_forward(module):
+                def custom_forward(*inputs):
+                    # None for past_key_value
+                    return module(*inputs, use_cache, output_attentions)
+
+                return custom_forward
+
+            outputs = torch.utils.checkpoint.checkpoint(
+                create_custom_forward(block),
+                hidden_states,
+                None,
+                attention_mask,
+                head_mask[i],
+                encoder_hidden_states,
+                encoder_attention_mask,
+            )
+        else:
+            outputs = block(
+                hidden_states,
+                layer_past=layer_past,
+                attention_mask=attention_mask,
+                head_mask=hm,
+                encoder_hidden_states=encoder_hidden_states,
+                encoder_attention_mask=encoder_attention_mask,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+            )
+
+        hidden_states = outputs[0]
+        if use_cache:
+            presents.append(outputs[1])
+
+        if output_attentions:
+            all_self_attentions = all_self_attentions + (outputs[2 if use_cache else 1],)
+            if self.config.add_cross_attention:
+                all_cross_attentions = all_cross_attentions + (outputs[3 if use_cache else 2],)
+
+        offload_loop_end(self, self.h, i)
+    hidden_states = offload_cleanup(self, self.h, hidden_states)
+
+    hidden_states = self.ln_f(hidden_states)
+
+    hidden_states = hidden_states.view(output_shape)
+    # Add last hidden state
+    if output_hidden_states:
+        all_hidden_states = all_hidden_states + (hidden_states,)
+
+    if not return_dict:
+        return tuple(
+            v
+            for v in [hidden_states, presents, all_hidden_states, all_self_attentions, all_cross_attentions]
+            if v is not None
+        )
+
+    return BaseModelOutputWithPastAndCrossAttentions(
+        last_hidden_state=hidden_states,
+        past_key_values=presents,
+        hidden_states=all_hidden_states,
+        attentions=all_self_attentions,
+        cross_attentions=all_cross_attentions,
+    )
+
+
+def mpt_offload_forward(self, input_ids: torch.LongTensor, past_key_values: Optional[List[Tuple[torch.FloatTensor]]]=None, attention_mask: Optional[torch.ByteTensor]=None, prefix_mask: Optional[torch.ByteTensor]=None, sequence_id: Optional[torch.LongTensor]=None, return_dict: Optional[bool]=None, output_attentions: Optional[bool]=None, output_hidden_states: Optional[bool]=None, use_cache: Optional[bool]=None):
+    return_dict = return_dict if return_dict is not None else self.config.return_dict
+    use_cache = use_cache if use_cache is not None else self.config.use_cache
+    if attention_mask is not None:
+        attention_mask = attention_mask.bool()
+    if prefix_mask is not None:
+        prefix_mask = prefix_mask.bool()
+    if not return_dict:
+        raise NotImplementedError('return_dict False is not implemented yet for MPT')
+    if output_attentions:
+        raise NotImplementedError('output_attentions is not implemented yet for MPT')
+    if attention_mask is not None and attention_mask[:, 0].sum() != attention_mask.shape[0] and self.training:
+        raise NotImplementedError('MPT does not support training with left padding.')
+    if self.prefix_lm and prefix_mask is None:
+        raise ValueError('prefix_mask is a required argument when MPT is configured with prefix_lm=True.')
+    if self.training:
+        if self.attn_uses_sequence_id and sequence_id is None:
+            raise ValueError('sequence_id is a required argument when MPT is configured with attn_uses_sequence_id=True ' + 'and the model is in train mode.')
+        elif self.attn_uses_sequence_id is False and sequence_id is not None:
+            warnings.warn('MPT received non-None input for `sequence_id` but is configured with attn_uses_sequence_id=False. ' + 'This input will be ignored. If you want the model to use `sequence_id`, set attn_uses_sequence_id to True.')
+    S = input_ids.size(1)
+    assert S <= self.config.max_seq_len, f'Cannot forward input with seq_len={S}, this model only supports seq_len<={self.config.max_seq_len}'
+    tok_emb = self.wte(input_ids)
+    if self.alibi:
+        x = tok_emb
+    else:
+        past_position = 0
+        if past_key_values is not None:
+            if len(past_key_values) != self.config.n_layers:
+                raise ValueError(f'past_key_values must provide a past_key_value for each attention ' + f'layer in the network (len(past_key_values)={len(past_key_values)!r}; self.config.n_layers={self.config.n_layers!r}).')
+            past_position = past_key_values[0][0].size(1)
+        if S + past_position > self.config.max_seq_len:
+            raise ValueError(f'Cannot forward input with past sequence length {past_position} and current sequence length {S + 1}, this model only supports total sequence length <= {self.config.max_seq_len}.')
+        pos = torch.arange(past_position, S + past_position, dtype=torch.long, device=input_ids.device).unsqueeze(0)
+        if attention_mask is not None:
+            pos = torch.clamp(pos - torch.cumsum((~attention_mask).to(torch.int32), dim=1)[:, past_position:], min=0)
+        pos_emb = self.wpe(pos)
+        x = tok_emb + pos_emb
+    if self.embedding_fraction == 1:
+        x = self.emb_drop(x)
+    else:
+        x_shrunk = x * self.embedding_fraction + x.detach() * (1 - self.embedding_fraction)
+        assert isinstance(self.emb_drop, nn.Module)
+        x = self.emb_drop(x_shrunk)
+    (attn_bias, attention_mask) = self._attn_bias(device=x.device, dtype=x.dtype, attention_mask=attention_mask, prefix_mask=prefix_mask, sequence_id=sequence_id)
+    if use_cache and past_key_values is None:
+        past_key_values = [() for _ in range(self.config.n_layers)]
+    all_hidden_states = () if output_hidden_states else None
+    for (b_idx, block) in enumerate(self.blocks):
+        past_key_value = past_key_values[b_idx] if past_key_values is not None else None
+        (
+            block,
+            x,
+            attention_mask,
+            _,
+            past_key_value,
+        ) = offload_loop_start(self, self.blocks, b_idx, x, attention_mask, None, past_key_value)
+        device = next(block.parameters()).device
+        if attn_bias.device != device:
+            attn_bias = attn_bias.to(device, torch.float16, True)
+
+        if output_hidden_states:
+            assert all_hidden_states is not None
+            all_hidden_states = all_hidden_states + (x,)
+        (x, past_key_value) = block(x, past_key_value=past_key_value, attn_bias=attn_bias, attention_mask=attention_mask, is_causal=self.is_causal)
+        if past_key_values is not None:
+            past_key_values[b_idx] = past_key_value
+
+        offload_loop_end(
+            self, self.blocks, b_idx
+        )
+    x = offload_cleanup(self, self.blocks, x)
+    x = self.norm_f(x)
+    return BaseModelOutputWithPast(last_hidden_state=x, past_key_values=past_key_values, hidden_states=all_hidden_states)
 
 
 def find_layers(module):
@@ -918,6 +1197,10 @@ def load_quant_offload(
         type(m).forward = gptj_offload_forward
     elif type(m) == OPTModel:
         type(m).forward = opt_offload_forward
+    elif type(m) == GPTBigCodeModel:
+        type(m).forward = bigcode_offload_forward
+    elif mpt_support and type(m) == MPTModel:
+        type(m).forward = mpt_offload_forward
     else:
         raise RuntimeError(f"Model type {type(m)} not supported by CPU offloader")
 

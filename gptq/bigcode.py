@@ -1,15 +1,20 @@
-import math
 import time
 
 import torch
 import torch.nn as nn
 
-from gptq import *
-from modelutils import *
-from quant import *
+import transformers
+
+from .gptq import GPTQ
+from .modelutils import DEV, find_layers, GPTQVERSION, make_quant
+
+if GPTQVERSION == 1:
+    from .quant_v2 import quantize, Quantizer, QuantLinear
+elif GPTQVERSION == 2:
+    from .quant_v3 import quantize, Quantizer, QuantLinear
 
 
-def get_gptneox(model):
+def get_bigcode(model):
     import torch
 
     def skip(*args, **kwargs):
@@ -18,23 +23,24 @@ def get_gptneox(model):
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
-    from transformers import GPTNeoXForCausalLM
+    from transformers import GPTBigCodeForCausalLM
 
-    model = GPTNeoXForCausalLM.from_pretrained(model, torch_dtype="auto")
+    model = GPTBigCodeForCausalLM.from_pretrained(model, torch_dtype="auto")
     model.seqlen = 2048
     return model
 
 
 @torch.no_grad()
-def gptneox_sequential(model, dataloader, dev):
+def bigcode_sequential(model, dataloader, dev):
     print("Starting ...")
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    layers = model.gpt_neox.layers
+    layers = model.transformer.h
 
-    model.gpt_neox.embed_in = model.gpt_neox.embed_in.to(dev)
-    model.gpt_neox.final_layer_norm = model.gpt_neox.final_layer_norm.to(dev)
+    model.transformer.wte = model.transformer.wte.to(dev)
+    model.transformer.wpe = model.transformer.wpe.to(dev)
+    model.transformer.ln_f = model.transformer.ln_f.to(dev)
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
@@ -52,7 +58,6 @@ def gptneox_sequential(model, dataloader, dev):
             inps[cache["i"]] = inp
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
-            cache["position_ids"] = kwargs["position_ids"]
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -64,13 +69,13 @@ def gptneox_sequential(model, dataloader, dev):
     layers[0] = layers[0].module
 
     layers[0] = layers[0].cpu()
-    model.gpt_neox.embed_in = model.gpt_neox.embed_in.cpu()
-    model.gpt_neox.final_layer_norm = model.gpt_neox.final_layer_norm.cpu()
+    model.transformer.wte = model.transformer.wte.cpu()
+    model.transformer.wpe = model.transformer.wpe.cpu()
+    model.transformer.ln_f = model.transformer.ln_f.cpu()
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
-    attention_mask = cache["attention_mask"]
-    position_ids = cache["position_ids"]
+    attention_mask = cache["attention_mask"].to(dev)
 
     print("Ready.")
 
@@ -80,10 +85,10 @@ def gptneox_sequential(model, dataloader, dev):
         full = find_layers(layer)
         if args.true_sequential:
             sequential = [
-                ["attention.query_key_value"],
-                ["attention.dense"],
-                ["mlp.dense_h_to_4h"],
-                ["mlp.dense_4h_to_h"],
+                ["attn.c_attn"],
+                ["attn.c_proj"],
+                ["mlp.c_fc"],
+                ["mlp.c_proj"],
             ]
         else:
             sequential = [list(full.keys())]
@@ -108,35 +113,41 @@ def gptneox_sequential(model, dataloader, dev):
             for name in subset:
                 handles.append(subset[name].register_forward_hook(add_batch(name)))
             for j in range(args.nsamples):
-                outs[j] = layer(
-                    inps[j].unsqueeze(0),
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                )[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
             for h in handles:
                 h.remove()
 
             for name in subset:
-                print(i, name)
-                print("Quantizing ...")
-                scale, zero = gptq[name].fasterquant(
-                    percdamp=args.percdamp,
-                    groupsize=args.groupsize,
-                    actorder=args.act_order,
-                )
-                quantizers["gpt_neox.layers.%d.%s" % (i, name)] = (
-                    gptq[name].quantizer,
-                    scale,
-                    zero,
-                )
+                print(f"Quantizing {name} in layer {i+1}/{len(layers)}...")
+                if GPTQVERSION == 1:
+                    scale, zero = gptq[name].fasterquant(
+                        percdamp=args.percdamp,
+                        groupsize=args.groupsize,
+                        actorder=args.act_order,
+                    )
+                    quantizers["transformer.h.%d.%s" % (i, name)] = (
+                        gptq[name].quantizer.cpu(),
+                        scale.cpu(),
+                        zero.cpu(),
+                    )
+                elif GPTQVERSION == 2:
+                    scale, zero, g_idx = gptq[name].fasterquant(
+                        percdamp=args.percdamp,
+                        groupsize=args.groupsize,
+                        actorder=args.act_order,
+                    )
+                    quantizers["transformer.h.%d.%s" % (i, name)] = (
+                        gptq[name].quantizer.cpu(),
+                        scale.cpu(),
+                        zero.cpu(),
+                        g_idx.cpu(),
+                    )
+                else:
+                    raise NotImplementedError("Unsupported GPTQVERSION")
                 gptq[name].free()
 
         for j in range(args.nsamples):
-            outs[j] = layer(
-                inps[j].unsqueeze(0),
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-            )[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
 
         layers[i] = layer.cpu()
         del layer
@@ -151,7 +162,7 @@ def gptneox_sequential(model, dataloader, dev):
 
 
 @torch.no_grad()
-def gptneox_eval(model, testenc, dev):
+def bigcode_eval(model, testenc, dev):
     print("Evaluating ...")
 
     testenc = testenc.input_ids
@@ -159,9 +170,10 @@ def gptneox_eval(model, testenc, dev):
 
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    layers = model.gpt_neox.layers
+    layers = model.transformer.h
 
-    model.gpt_neox.embed_in = model.gpt_neox.embed_in.to(dev)
+    model.transformer.wte = model.transformer.wte.to(dev)
+    model.transformer.wpe = model.transformer.wpe.to(dev)
     layers[0] = layers[0].to(dev)
 
     dtype = next(iter(model.parameters())).dtype
@@ -179,7 +191,6 @@ def gptneox_eval(model, testenc, dev):
             inps[cache["i"]] = inp
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
-            cache["position_ids"] = kwargs["position_ids"]
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -192,12 +203,12 @@ def gptneox_eval(model, testenc, dev):
     layers[0] = layers[0].module
 
     layers[0] = layers[0].cpu()
-    model.gpt_neox.embed_in = model.gpt_neox.embed_in.cpu()
+    model.transformer.wte = model.transformer.wte.cpu()
+    model.transformer.wpe = model.transformer.wpe.cpu()
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
-    position_ids = cache["position_ids"]
 
     for i in range(len(layers)):
         print(i)
@@ -207,7 +218,9 @@ def gptneox_eval(model, testenc, dev):
             subset = find_layers(layer)
             for name in subset:
                 quantizer = Quantizer()
-                quantizer.configure(args.wbits, perchannel=True, sym=False, mse=False)
+                quantizer.configure(
+                    args.wbits, perchannel=True, sym=args.sym, mse=False
+                )
                 W = subset[name].weight.data
                 quantizer.find_params(W, weight=True)
                 subset[name].weight.data = quantize(
@@ -215,27 +228,23 @@ def gptneox_eval(model, testenc, dev):
                 ).to(next(iter(layer.parameters())).dtype)
 
         for j in range(nsamples):
-            outs[j] = layer(
-                inps[j].unsqueeze(0),
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-            )[0]
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
         inps, outs = outs, inps
 
-    if model.gpt_neox.final_layer_norm is not None:
-        model.gpt_neox.final_layer_norm = model.gpt_neox.final_layer_norm.to(dev)
-    model.embed_out = model.embed_out.to(dev)
+    if model.transformer.ln_f is not None:
+        model.transformer.ln_f = model.transformer.ln_f.to(dev)
+    model.lm_head = model.lm_head.to(dev)
 
     testenc = testenc.to(dev)
     nlls = []
     for i in range(nsamples):
         hidden_states = inps[i].unsqueeze(0)
-        if model.gpt_neox.final_layer_norm is not None:
-            hidden_states = model.gpt_neox.final_layer_norm(hidden_states)
-        lm_logits = model.embed_out(hidden_states)
+        if model.transformer.ln_f is not None:
+            hidden_states = model.transformer.ln_f(hidden_states)
+        lm_logits = model.lm_head(hidden_states)
         shift_logits = lm_logits[:, :-1, :].contiguous()
         shift_labels = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)][:, 1:]
         loss_fct = nn.CrossEntropyLoss()
@@ -251,7 +260,7 @@ def gptneox_eval(model, testenc, dev):
 
 
 # TODO: perform packing on GPU
-def gptneox_pack(model, quantizers, wbits, groupsize):
+def bigcode_pack(model, quantizers, wbits, groupsize):
     layers = find_layers(model)
     layers = {n: layers[n] for n in quantizers}
     make_quant(model, quantizers, wbits, groupsize)
@@ -259,33 +268,38 @@ def gptneox_pack(model, quantizers, wbits, groupsize):
     print("Packing ...")
     for name in qlayers:
         print(name)
-        quantizers[name], scale, zero = quantizers[name]
-        quantizers[name], scale, zero = quantizers[name].cpu(), scale.cpu(), zero.cpu()
-        qlayers[name].pack(layers[name], scale, zero)
+        if GPTQVERSION == 1:
+            quantizers[name], scale, zero = quantizers[name]
+            qlayers[name].pack(layers[name], scale, zero)
+        elif GPTQVERSION == 2:
+            quantizers[name], scale, zero, g_idx = quantizers[name]
+            qlayers[name].pack(layers[name], scale, zero, g_idx)
+        else:
+            raise NotImplementedError("Unsupported GPTQVERSION")
     print("Done.")
     return model
 
 
 def load_quant(model, checkpoint, wbits, groupsize=-1):
-    from transformers import GPTNeoXConfig, GPTNeoXForCausalLM
+    from transformers import GPTBigCodeConfig, GPTBigCodeForCausalLM
 
-    config = GPTNeoXConfig.from_pretrained(model)
+    config = GPTBigCodeConfig.from_pretrained(model)
 
     def noop(*args, **kwargs):
         pass
 
     torch.nn.init.kaiming_uniform_ = noop
     torch.nn.init.uniform_ = noop
-    torch.nn.init.final_layer_normal_ = noop
+    torch.nn.init.normal_ = noop
 
     torch.set_default_dtype(torch.half)
     transformers.modeling_utils._init_weights = False
     torch.set_default_dtype(torch.half)
-    model = GPTNeoXForCausalLM(config)
+    model = GPTBigCodeForCausalLM(config)
     torch.set_default_dtype(torch.float)
     model = model.eval()
     layers = find_layers(model)
-    for name in ["embed_out"]:
+    for name in ["lm_head"]:
         if name in layers:
             del layers[name]
     make_quant(model, layers, wbits, groupsize)
@@ -305,13 +319,14 @@ def load_quant(model, checkpoint, wbits, groupsize=-1):
     return model
 
 
-def gptneox_multigpu(model, gpus):
-    model.gpt_neox.embed_in = model.gpt_neox.embed_in.to(gpus[0])
-    if hasattr(model.gpt_neox, "final_layer_norm") and model.gpt_neox.final_layer_norm:
-        model.gpt_neox.final_layer_norm = model.gpt_neox.final_layer_norm.to(gpus[-1])
+def bigcode_multigpu(model, gpus):
+    model.transformer.wte = model.transformer.wte.to(gpus[0])
+    model.transformer.wpe = model.transformer.wpe.to(gpus[0])
+    if hasattr(model.transformer, "ln_f") and model.transformer.ln_f:
+        model.transformer.ln_f = model.transformer.ln_f.to(gpus[-1])
     import copy
 
-    model.embed_out = copy.deepcopy(model.embed_out).to(gpus[-1])
+    model.lm_head = copy.deepcopy(model.lm_head).to(gpus[-1])
 
     cache = {"mask": None}
 
@@ -331,7 +346,7 @@ def gptneox_multigpu(model, gpus):
             tmp = self.module(*inp, **kwargs)
             return tmp
 
-    layers = model.gpt_neox.layers
+    layers = model.transformer.h
     pergpu = math.ceil(len(layers) / len(gpus))
     for i in range(len(layers)):
         layers[i] = MoveModule(layers[i].to(gpus[i // pergpu]))
@@ -352,7 +367,7 @@ def benchmark(model, input_ids, check=False):
 
         return tmp
 
-    for i, layer in enumerate(model.gpt_neox.layers):
+    for i, layer in enumerate(model.transformer.h):
         layer.register_forward_hook(clear_past(i))
 
     print("Benchmarking ...")
@@ -400,11 +415,11 @@ def benchmark(model, input_ids, check=False):
 
 if __name__ == "__main__":
     import argparse
-    from datautils import *
+    from .datautils import *
 
     parser = argparse.ArgumentParser()
 
-    parser.add_argument("model", type=str, help="gptneox model to load")
+    parser.add_argument("model", type=str, help="bigcode model to load")
     parser.add_argument(
         "dataset",
         type=str,
@@ -489,11 +504,9 @@ if __name__ == "__main__":
         args.load = args.load.as_posix()
 
     if args.load:
-        model = load_quant(
-            args.model, args.load, args.wbits, args.groupsize
-        )
+        model = load_quant(args.model, args.load, args.wbits, args.groupsize)
     else:
-        model = get_gptneox(args.model)
+        model = get_bigcode(args.model)
         model.eval()
 
     dataloader, testloader = get_loaders(
@@ -502,13 +515,22 @@ if __name__ == "__main__":
         seed=args.seed,
         model=args.model,
         seqlen=model.seqlen,
-        use_fast=True,
     )
 
     if not args.load and args.wbits < 16 and not args.nearest:
         tick = time.time()
-        quantizers = gptneox_sequential(model, dataloader, DEV)
+        quantizers = bigcode_sequential(model, dataloader, DEV)
         print(time.time() - tick)
+
+    if args.benchmark:
+        gpus = [torch.device("cuda:%d" % i) for i in range(torch.cuda.device_count())]
+        if len(gpus) > 1:
+            bigcode_multigpu(model, gpus)
+        else:
+            model = model.to(DEV)
+        if args.benchmark:
+            input_ids = next(iter(dataloader))[0][:, : args.benchmark]
+            benchmark(model, input_ids, check=args.check)
 
     if args.eval:
         datasets = ["wikitext2", "ptb", "c4"]
@@ -519,24 +541,19 @@ if __name__ == "__main__":
                 dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
             )
             print(dataset)
-            gptneox_eval(model, testloader, DEV)
+            bigcode_eval(model, testloader, DEV)
+
+    if args.load:
+        exit()
 
     if args.save:
-        gptneox_pack(model, quantizers, args.wbits, args.groupsize)
+        bigcode_pack(model, quantizers, args.wbits, args.groupsize)
         torch.save(model.state_dict(), args.save)
 
     if args.save_safetensors:
-        gptneox_pack(model, quantizers, args.wbits, args.groupsize)
+        bigcode_pack(model, quantizers, args.wbits, args.groupsize)
         from safetensors.torch import save_file as safe_save
 
-        safe_save(model.state_dict(), args.save_safetensors)
-
-    if args.benchmark:
-        gpus = [torch.device("cuda:%d" % i) for i in range(torch.cuda.device_count())]
-        if len(gpus) > 1:
-            gptneox_multigpu(model, gpus)
-        else:
-            model = model.to(DEV)
-        if args.benchmark:
-            input_ids = next(iter(dataloader))[0][:, : args.benchmark]
-            benchmark(model, input_ids, check=args.check)
+        state_dict = model.state_dict()
+        state_dict = {k: v.clone().contiguous() for k, v in state_dict.items()}
+        safe_save(state_dict, args.save_safetensors)

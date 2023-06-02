@@ -4,9 +4,15 @@ import time
 import torch
 import torch.nn as nn
 
-from gptq import *
-from modelutils import *
-from quant import *
+import transformers
+
+from .gptq import GPTQ
+from .modelutils import DEV, find_layers, GPTQVERSION, make_quant
+
+if GPTQVERSION == 1:
+    from .quant_v2 import quantize, Quantizer, QuantLinear
+elif GPTQVERSION == 2:
+    from .quant_v3 import quantize, Quantizer, QuantLinear
 
 
 def get_gptj(model):
@@ -117,18 +123,32 @@ def gptj_sequential(model, dataloader, dev):
                 h.remove()
 
             for name in subset:
-                print(i, name)
-                print("Quantizing ...")
-                scale, zero = gptq[name].fasterquant(
-                    percdamp=args.percdamp,
-                    groupsize=args.groupsize,
-                    actorder=args.act_order,
-                )
-                quantizers["transformer.h.%d.%s" % (i, name)] = (
-                    gptq[name].quantizer,
-                    scale,
-                    zero,
-                )
+                print(f"Quantizing {name} in layer {i+1}/{len(layers)}...")
+                if GPTQVERSION == 1:
+                    scale, zero = gptq[name].fasterquant(
+                        percdamp=args.percdamp,
+                        groupsize=args.groupsize,
+                        actorder=args.act_order,
+                    )
+                    quantizers["transformer.h.%d.%s" % (i, name)] = (
+                        gptq[name].quantizer.cpu(),
+                        scale.cpu(),
+                        zero.cpu(),
+                    )
+                elif GPTQVERSION == 2:
+                    scale, zero, g_idx = gptq[name].fasterquant(
+                        percdamp=args.percdamp,
+                        groupsize=args.groupsize,
+                        actorder=args.act_order,
+                    )
+                    quantizers["transformer.h.%d.%s" % (i, name)] = (
+                        gptq[name].quantizer.cpu(),
+                        scale.cpu(),
+                        zero.cpu(),
+                        g_idx.cpu(),
+                    )
+                else:
+                    raise NotImplementedError("Unsupported GPTQVERSION")
                 gptq[name].free()
 
         for j in range(args.nsamples):
@@ -207,7 +227,9 @@ def gptj_eval(model, testenc, dev):
             subset = find_layers(layer)
             for name in subset:
                 quantizer = Quantizer()
-                quantizer.configure(args.wbits, perchannel=True, sym=False, mse=False)
+                quantizer.configure(
+                    args.wbits, perchannel=True, sym=args.sym, mse=False
+                )
                 W = subset[name].weight.data
                 quantizer.find_params(W, weight=True)
                 subset[name].weight.data = quantize(
@@ -259,9 +281,14 @@ def gptj_pack(model, quantizers, wbits, groupsize):
     print("Packing ...")
     for name in qlayers:
         print(name)
-        quantizers[name], scale, zero = quantizers[name]
-        quantizers[name], scale, zero = quantizers[name].cpu(), scale.cpu(), zero.cpu()
-        qlayers[name].pack(layers[name], scale, zero)
+        if GPTQVERSION == 1:
+            quantizers[name], scale, zero = quantizers[name]
+            qlayers[name].pack(layers[name], scale, zero)
+        elif GPTQVERSION == 2:
+            quantizers[name], scale, zero, g_idx = quantizers[name]
+            qlayers[name].pack(layers[name], scale, zero, g_idx)
+        else:
+            raise NotImplementedError("Unsupported GPTQVERSION")
     print("Done.")
     return model
 
@@ -400,7 +427,7 @@ def benchmark(model, input_ids, check=False):
 
 if __name__ == "__main__":
     import argparse
-    from datautils import *
+    from .datautils import *
 
     parser = argparse.ArgumentParser()
 
@@ -489,9 +516,7 @@ if __name__ == "__main__":
         args.load = args.load.as_posix()
 
     if args.load:
-        model = load_quant(
-            args.model, args.load, args.wbits, args.groupsize
-        )
+        model = load_quant(args.model, args.load, args.wbits, args.groupsize)
     else:
         model = get_gptj(args.model)
         model.eval()
@@ -510,6 +535,16 @@ if __name__ == "__main__":
         quantizers = gptj_sequential(model, dataloader, DEV)
         print(time.time() - tick)
 
+    if args.benchmark:
+        gpus = [torch.device("cuda:%d" % i) for i in range(torch.cuda.device_count())]
+        if len(gpus) > 1:
+            gptj_multigpu(model, gpus)
+        else:
+            model = model.to(DEV)
+        if args.benchmark:
+            input_ids = next(iter(dataloader))[0][:, : args.benchmark]
+            benchmark(model, input_ids, check=args.check)
+
     if args.eval:
         datasets = ["wikitext2", "ptb", "c4"]
         if args.new_eval:
@@ -525,6 +560,9 @@ if __name__ == "__main__":
             print(dataset)
             gptj_eval(model, testloader, DEV)
 
+    if args.load:
+        exit()
+
     if args.save:
         gptj_pack(model, quantizers, args.wbits, args.groupsize)
         torch.save(model.state_dict(), args.save)
@@ -534,13 +572,3 @@ if __name__ == "__main__":
         from safetensors.torch import save_file as safe_save
 
         safe_save(model.state_dict(), args.save_safetensors)
-
-    if args.benchmark:
-        gpus = [torch.device("cuda:%d" % i) for i in range(torch.cuda.device_count())]
-        if len(gpus) > 1:
-            gptj_multigpu(model, gpus)
-        else:
-            model = model.to(DEV)
-        if args.benchmark:
-            input_ids = next(iter(dataloader))[0][:, : args.benchmark]
-            benchmark(model, input_ids, check=args.check)

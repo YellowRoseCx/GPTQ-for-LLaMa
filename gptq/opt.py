@@ -3,9 +3,14 @@ import time
 import torch
 import torch.nn as nn
 
-from gptq import *
-from modelutils import *
-from quant import *
+import transformers
+
+from .gptq import GPTQ
+from .modelutils import DEV, find_layers, GPTQVERSION, make_quant
+if GPTQVERSION == 1:
+    from .quant_v2 import quantize, Quantizer, QuantLinear
+elif GPTQVERSION == 2:
+    from .quant_v3 import quantize, Quantizer, QuantLinear
 
 
 def get_opt(model):
@@ -101,8 +106,14 @@ def opt_sequential(model, dataloader, dev):
             
         for name in subset:	
             print(f'Quantizing {name} in layer {i+1}/{len(layers)}...')
-            scale,zero = gptq[name].fasterquant(percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order)
-            quantizers['model.decoder.layers.%d.%s' % (i, name)] = (gptq[name].quantizer.cpu(),scale.cpu(),zero.cpu())
+            if GPTQVERSION == 1:
+                scale,zero = gptq[name].fasterquant(percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order)
+                quantizers['model.decoder.layers.%d.%s' % (i, name)] = (gptq[name].quantizer.cpu(),scale.cpu(),zero.cpu())
+            elif GPTQVERSION == 2:
+                scale,zero,g_idx = gptq[name].fasterquant(percdamp=args.percdamp, groupsize=args.groupsize, actorder=args.act_order)
+                quantizers['model.decoder.layers.%d.%s' % (i, name)] = (gptq[name].quantizer.cpu(),scale.cpu(),zero.cpu(),g_idx.cpu())
+            else:
+                raise NotImplementedError("Unsupported GPTQVERSION")
             gptq[name].free()
 
         for j in range(args.nsamples):
@@ -235,12 +246,18 @@ def opt_pack(model, quantizers, wbits, groupsize):
     print('Packing ...')
     for name in qlayers:
         print(name)
-        quantizers[name],scale,zero = quantizers[name]
-        qlayers[name].pack(layers[name], scale, zero)
+        if GPTQVERSION == 1:
+            quantizers[name],scale,zero = quantizers[name]
+            qlayers[name].pack(layers[name], scale, zero)
+        elif GPTQVERSION == 2:
+            quantizers[name],scale,zero,g_idx = quantizers[name]
+            qlayers[name].pack(layers[name], scale, zero, g_idx)
+        else:
+            raise NotImplementedError("Unsupported GPTQVERSION")
     print('Done.')
     return model
 
-def load_quant(model, checkpoint, wbits, groupsize=-1):
+def load_quant(model, checkpoint, wbits, groupsize):
     from transformers import OPTConfig, OPTForCausalLM 
     config = OPTConfig.from_pretrained(model)
     def noop(*args, **kwargs):
@@ -402,7 +419,7 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '--eval', action='store_true',
-        help='Evaluate quantized model.'
+        help='evaluate quantized model.'
     )
     parser.add_argument(
         '--save', type=str, default='',
@@ -467,9 +484,6 @@ if __name__ == '__main__':
             input_ids = next(iter(dataloader))[0][:, :args.benchmark]
             benchmark(model, input_ids, check=args.check)
             
-    if args.load:
-        exit()
-
     if args.eval:
         datasets = ['wikitext2', 'ptb', 'c4'] 
         if args.new_eval:
@@ -481,6 +495,9 @@ if __name__ == '__main__':
             print(dataset)
             opt_eval(model, testloader, DEV)
 
+    if args.load:
+        exit()
+
     if args.save:
         opt_pack(model, quantizers, args.wbits, args.groupsize)
         torch.save(model.state_dict(), args.save) 
@@ -489,5 +506,6 @@ if __name__ == '__main__':
         opt_pack(model, quantizers, args.wbits, args.groupsize)
         from safetensors.torch import save_file as safe_save
         state_dict = model.state_dict()
-        state_dict['lm_head.weight'] = state_dict['lm_head.weight'].clone()
+        state_dict = {k: v.clone().contiguous() for k, v in state_dict.items()}
         safe_save(state_dict, args.save_safetensors)
+
