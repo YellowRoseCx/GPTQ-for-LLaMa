@@ -12,6 +12,11 @@ if GPTQVERSION == 1:
 elif GPTQVERSION == 2:
     from .quant_v3 import quantize, Quantizer, QuantLinear
 
+try:
+    from hf_bleeding_edge.rw import RWConfig, RWForCausalLM
+except ImportError:
+    pass
+
 
 def get_rw(model):
     import torch
@@ -22,9 +27,8 @@ def get_rw(model):
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
-    from transformers import AutoTokenizer, AutoModelForCausalLM
 
-    model = AutoTokenizer.from_pretrained(model, torch_dtype="auto")
+    model = RWForCausalLM.from_pretrained(model, torch_dtype="auto")
     model.seqlen = 2048
     return model
 
@@ -56,7 +60,7 @@ def rw_sequential(model, dataloader, dev):
             inps[cache["i"]] = hidden_states
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
-            cache["position_ids"] = kwargs["position_ids"]
+            cache["alibi"] = kwargs["alibi"]
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -74,7 +78,7 @@ def rw_sequential(model, dataloader, dev):
 
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
-    position_ids = cache["position_ids"]
+    alibi = cache["alibi"]
 
     print("Ready.")
 
@@ -115,7 +119,7 @@ def rw_sequential(model, dataloader, dev):
                 outs[j] = layer(
                     inps[j].unsqueeze(0),
                     attention_mask=attention_mask,
-                    position_ids=position_ids,
+                    alibi=alibi,
                 )[0]
             for h in handles:
                 h.remove()
@@ -153,7 +157,7 @@ def rw_sequential(model, dataloader, dev):
             outs[j] = layer(
                 inps[j].unsqueeze(0),
                 attention_mask=attention_mask,
-                position_ids=position_ids,
+                alibi=alibi,
             )[0]
 
         layers[i] = layer.cpu()
@@ -197,7 +201,7 @@ def rw_eval(model, testenc, dev):
             inps[cache["i"]] = inp
             cache["i"] += 1
             cache["attention_mask"] = kwargs["attention_mask"]
-            cache["position_ids"] = kwargs["position_ids"]
+            cache["alibi"] = kwargs["alibi"]
             raise ValueError
 
     layers[0] = Catcher(layers[0])
@@ -215,7 +219,7 @@ def rw_eval(model, testenc, dev):
 
     outs = torch.zeros_like(inps)
     attention_mask = cache["attention_mask"]
-    position_ids = cache["position_ids"]
+    alibi = cache["alibi"]
 
     for i in range(len(layers)):
         print(i)
@@ -238,7 +242,7 @@ def rw_eval(model, testenc, dev):
             outs[j] = layer(
                 inps[j].unsqueeze(0),
                 attention_mask=attention_mask,
-                position_ids=position_ids,
+                alibi=alibi,
             )[0]
         layers[i] = layer.cpu()
         del layer
@@ -292,9 +296,7 @@ def rw_pack(model, quantizers, wbits, groupsize):
 
 
 def load_quant(model, checkpoint, wbits, groupsize=-1):
-    from transformers import AutoConfig, AutoTokenizer
-
-    config = AutoConfig.from_pretrained(model)
+    config = RWConfig.from_pretrained(model)
 
     def noop(*args, **kwargs):
         pass
@@ -306,7 +308,7 @@ def load_quant(model, checkpoint, wbits, groupsize=-1):
     torch.set_default_dtype(torch.half)
     transformers.modeling_utils._init_weights = False
     torch.set_default_dtype(torch.half)
-    model = AutoTokenizer(config)
+    model = RWForCausalLM(config)
     torch.set_default_dtype(torch.float)
     model = model.eval()
     layers = find_layers(model)
@@ -567,4 +569,3 @@ if __name__ == "__main__":
         from safetensors.torch import save_file as safe_save
 
         safe_save(model.state_dict(), args.save_safetensors)
-
