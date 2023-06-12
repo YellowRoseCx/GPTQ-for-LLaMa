@@ -1173,9 +1173,9 @@ def find_layers(module):
 
 
 def load_quant_offload(
-    load_quant_func, model, checkpoint, wbits, groupsize, gpu_layers, offload_type=0
+    load_quant_func, model, checkpoint, wbits, groupsize, gpu_layers, offload_type=0, force_bias=False,
 ):
-    model = load_quant_func(model, checkpoint, wbits, groupsize)
+    model = load_quant_func(model, checkpoint, wbits, groupsize, force_bias=force_bias)
 
     gpu_order = []
 

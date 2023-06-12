@@ -293,7 +293,7 @@ def gptneox_pack(model, quantizers, wbits, groupsize):
     return model
 
 
-def load_quant(model, checkpoint, wbits, groupsize=-1):
+def load_quant(model, checkpoint, wbits, groupsize=-1, force_bias=False):
     from transformers import GPTNeoXConfig, GPTNeoXForCausalLM
 
     config = GPTNeoXConfig.from_pretrained(model)
@@ -315,7 +315,7 @@ def load_quant(model, checkpoint, wbits, groupsize=-1):
     for name in ["embed_out"]:
         if name in layers:
             del layers[name]
-    make_quant(model, layers, wbits, groupsize)
+    make_quant(model, layers, wbits, groupsize, force_bias=force_bias)
 
     del layers
 

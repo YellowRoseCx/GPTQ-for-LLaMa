@@ -130,7 +130,7 @@ class Quantizer(nn.Module):
 
 import quant_cuda_v3 as quant_cuda
 
-def make_quant(module, names, bits, groupsize, name=''):
+def make_quant(module, names, bits, groupsize, name='', force_bias=False):
     if isinstance(module, QuantLinear):
         return
     for attr in dir(module):
@@ -138,9 +138,9 @@ def make_quant(module, names, bits, groupsize, name=''):
         name1 = name + '.' + attr if name != '' else attr
         if name1 in names:
             delattr(module, attr)
-            setattr(module, attr, QuantLinear(bits, groupsize, tmp.in_features, tmp.out_features, tmp.bias is not None))
+            setattr(module, attr, QuantLinear(bits, groupsize, tmp.in_features, tmp.out_features, force_bias or tmp.bias is not None))
     for name1, child in module.named_children():
-        make_quant(child, names, bits, groupsize, name + '.' + name1 if name != '' else name1)
+        make_quant(child, names, bits, groupsize, name + '.' + name1 if name != '' else name1, force_bias=force_bias)
 
 class QuantLinear(nn.Module): 
     def __init__(self, bits, groupsize, infeatures, outfeatures, bias, kernel_switch_threshold=128):

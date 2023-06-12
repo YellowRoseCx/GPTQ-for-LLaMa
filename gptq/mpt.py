@@ -279,7 +279,7 @@ def mpt_pack(model, quantizers, wbits, groupsize):
     return model
 
 
-def load_quant(model, checkpoint, wbits, groupsize=-1):
+def load_quant(model, checkpoint, wbits, groupsize=-1, force_bias=False):
     config = MPTConfig.from_pretrained(model)
 
     def noop(*args, **kwargs):
@@ -299,7 +299,7 @@ def load_quant(model, checkpoint, wbits, groupsize=-1):
     for name in ["lm_head"]:
         if name in layers:
             del layers[name]
-    make_quant(model, layers, wbits, groupsize)
+    make_quant(model, layers, wbits, groupsize, force_bias=force_bias)
 
     del layers
 

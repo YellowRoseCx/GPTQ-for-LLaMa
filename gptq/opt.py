@@ -257,7 +257,7 @@ def opt_pack(model, quantizers, wbits, groupsize):
     print('Done.')
     return model
 
-def load_quant(model, checkpoint, wbits, groupsize):
+def load_quant(model, checkpoint, wbits, groupsize, force_bias=False):
     from transformers import OPTConfig, OPTForCausalLM 
     config = OPTConfig.from_pretrained(model)
     def noop(*args, **kwargs):
@@ -276,7 +276,7 @@ def load_quant(model, checkpoint, wbits, groupsize):
     for name in ['model.decoder.project_out', 'model.decoder.project_in', 'lm_head']:
         if name in layers:
             del layers[name]
-    make_quant(model, layers, wbits, groupsize)
+    make_quant(model, layers, wbits, groupsize, force_bias=force_bias)
     
     del layers
 

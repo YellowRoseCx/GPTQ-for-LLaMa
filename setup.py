@@ -3,7 +3,7 @@ from torch.utils import cpp_extension
 
 setup(
     name="gptq-koboldai",
-    version="0.0.5",
+    version="0.0.6",
     install_requires=[
         "torch",
     ],

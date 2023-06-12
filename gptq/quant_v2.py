@@ -417,7 +417,7 @@ class QuantLinear(nn.Module):
         y = y.to(output_dtype)
         return y.reshape(outshape)
 
-def make_quant(module, names, bits, groupsize, name='', kernel_switch_threshold=128):
+def make_quant(module, names, bits, groupsize, name='', kernel_switch_threshold=128, force_bias=False):
     if isinstance(module, QuantLinear):
         return
     for attr in dir(module):

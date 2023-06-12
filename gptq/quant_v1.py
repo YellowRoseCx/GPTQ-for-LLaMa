@@ -39,7 +39,7 @@ class QuantLinear(torch.nn.Module):
         return y.reshape(outshape)
 
 
-def make_quant(module, names, bits, groupsize, faster=False, name=""):
+def make_quant(module, names, bits, groupsize, faster=False, name="", force_bias=False):
     if isinstance(module, QuantLinear):
         return
     for attr in dir(module):
